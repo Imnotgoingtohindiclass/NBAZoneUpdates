@@ -4,9 +4,11 @@ import datetime
 import sqlite3
 from dotenv import load_dotenv
 import pandas as pd
+import pytz # Required for timezone handling: pip install pytz
 
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, ApplicationBuilder
+from telegram.error import Forbidden, BadRequest # For handling send errors
 
 # --- NBA API Imports ---
 from nba_api.stats.static import players, teams
@@ -14,18 +16,18 @@ from nba_api.stats.endpoints import (
     playercareerstats,
     playergamelog,
     commonteamroster,
-    teamyearbyyearstats,
     leaguegamefinder,
     leaguestandingsv3,
-    leaguedashteamstats
+    leaguedashteamstats,
+    commonplayerinfo
 )
-from nba_api.stats.library.parameters import SeasonAll
 
 # --- Configuration ---
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CURRENT_SEASON = '2024-25'
 DB_FILE = 'nba_bot_data.db'
+NBA_TZ = pytz.timezone("Asia/Singapore")
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -37,75 +39,423 @@ logger = logging.getLogger(__name__)
 # --- Database Functions ---
 
 def init_db():
-    """Initializes the database and creates the follows table if it doesn't exist."""
+    """Initializes the database and creates tables if they don't exist."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            # Create table with case-insensitive collation for player names
-            # Use PRIMARY KEY constraint to prevent duplicate entries per user
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_player_follows (
-                    chat_id INTEGER NOT NULL,
-                    player_full_name TEXT NOT NULL COLLATE NOCASE,
-                    PRIMARY KEY (chat_id, player_full_name)
-                )
-            ''')
+            
+            # Check if tables exist with the correct structure
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user_player_follows'")
+            table_exists = cursor.fetchone() is not None
+            
+            if table_exists:
+                # Check if the table has the correct structure
+                cursor.execute("PRAGMA table_info(user_player_follows)")
+                columns = [column[1] for column in cursor.fetchall()]
+                
+                # If player_id column is missing, drop and recreate the tables
+                if 'player_id' not in columns:
+                    logger.info("Database exists but has incorrect structure. Recreating tables...")
+                    cursor.execute("DROP TABLE IF EXISTS user_player_follows")
+                    cursor.execute("DROP TABLE IF EXISTS sent_notifications")
+                    table_exists = False
+            
+            # Create tables if they don't exist
+            if not table_exists:
+                # Create user_player_follows table
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_player_follows (
+                        chat_id INTEGER NOT NULL,
+                        player_id INTEGER NOT NULL,
+                        player_full_name TEXT NOT NULL COLLATE NOCASE,
+                        PRIMARY KEY (chat_id, player_id)
+                    )
+                ''')
+                # Add index for faster lookup by player_id in jobs
+                cursor.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_player_id ON user_player_follows (player_id)
+                ''')
+
+                # Create table to track sent notifications
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS sent_notifications (
+                        chat_id INTEGER NOT NULL,
+                        player_id INTEGER NOT NULL,
+                        game_id TEXT NOT NULL,
+                        notification_type TEXT NOT NULL, -- 'upcoming' or 'finished'
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (chat_id, player_id, game_id, notification_type)
+                    )
+                ''')
+            
             conn.commit()
-            logger.info(f"Database {DB_FILE} initialized successfully.")
+            logger.info(f"Database {DB_FILE} initialized/updated successfully.")
     except sqlite3.Error as e:
         logger.error(f"Database initialization error: {e}")
-        raise # Reraise the error to potentially stop the bot if DB is critical
+        raise
 
-def add_follow(chat_id: int, player_name: str) -> bool:
-    """Adds a player to a user's follow list in the database. Returns True if added, False if already exists."""
+def add_follow(chat_id: int, player_id: int, player_name: str) -> bool:
+    """Adds a player (with ID) to a user's follow list. Returns True if added."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
-            # INSERT OR IGNORE will do nothing if the (chat_id, player_name) pair already exists
             cursor.execute('''
-                INSERT OR IGNORE INTO user_player_follows (chat_id, player_full_name)
-                VALUES (?, ?)
-            ''', (chat_id, player_name))
+                INSERT OR IGNORE INTO user_player_follows (chat_id, player_id, player_full_name)
+                VALUES (?, ?, ?)
+            ''', (chat_id, player_id, player_name))
             conn.commit()
-            # cursor.rowcount will be 1 if a row was inserted, 0 if it was ignored (already exists)
             return cursor.rowcount > 0
     except sqlite3.Error as e:
-        logger.error(f"Error adding follow for chat {chat_id}, player {player_name}: {e}")
-        return False # Indicate failure
+        logger.error(f"Error adding follow for chat {chat_id}, player ID {player_id}: {e}")
+        return False
 
 def remove_follow(chat_id: int, player_name: str) -> bool:
-    """Removes a player from a user's follow list. Returns True if removed, False otherwise."""
+    """Removes a player from a user's follow list by name. Returns True if removed."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
+            # Note: Still using player_full_name for deletion as provided by user
             cursor.execute('''
                 DELETE FROM user_player_follows
                 WHERE chat_id = ? AND player_full_name = ?
             ''', (chat_id, player_name))
             conn.commit()
-            # cursor.rowcount will be 1 if a row was deleted, 0 if no matching row was found
+            # Also clean up any sent notifications for this user/player combo if unfollowed
+            # This is optional but good practice
+            if cursor.rowcount > 0:
+                cursor.execute('''
+                    DELETE FROM sent_notifications
+                    WHERE chat_id = ? AND player_id = (
+                        SELECT player_id FROM user_player_follows WHERE chat_id = ? AND player_full_name = ? LIMIT 1
+                    )
+                ''', (chat_id, chat_id, player_name)) # Re-querying player_id is needed here or pass it
+                conn.commit()
             return cursor.rowcount > 0
     except sqlite3.Error as e:
         logger.error(f"Error removing follow for chat {chat_id}, player {player_name}: {e}")
-        return False # Indicate failure
+        return False
 
-def get_followed_players(chat_id: int) -> list[str]:
-    """Retrieves the list of players a user follows."""
+def get_followed_players(chat_id: int) -> list[tuple[int, str]]:
+    """Retrieves the list of (player_id, player_full_name) a user follows."""
     try:
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                SELECT player_full_name FROM user_player_follows
+                SELECT player_id, player_full_name FROM user_player_follows
                 WHERE chat_id = ?
                 ORDER BY player_full_name COLLATE NOCASE ASC
             ''', (chat_id,))
-            # fetchall() returns a list of tuples, e.g., [('LeBron James',), ('Stephen Curry',)]
-            # We extract the first element from each tuple.
-            followed = [row[0] for row in cursor.fetchall()]
+            followed = cursor.fetchall() # Returns list of tuples [(id, name), ...]
             return followed
     except sqlite3.Error as e:
         logger.error(f"Error fetching followed players for chat {chat_id}: {e}")
-        return [] # Return empty list on error
+        return []
+    
+def get_all_follows() -> dict[int, list[int]]:
+    """Retrieves all player follows, mapping player_id to list of chat_ids."""
+    follows = {}
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            # Get distinct player_ids first for efficiency maybe? No, easier to group later.
+            cursor.execute('SELECT player_id, chat_id FROM user_player_follows')
+            for player_id, chat_id in cursor.fetchall():
+                if player_id not in follows:
+                    follows[player_id] = []
+                if chat_id not in follows[player_id]: # Avoid duplicates if DB somehow has them
+                    follows[player_id].append(chat_id)
+            return follows
+    except sqlite3.Error as e:
+        logger.error(f"Error fetching all follows: {e}")
+        return {}
+    
+
+# New functions to check/mark sent notifications
+def has_notification_been_sent(chat_id: int, player_id: int, game_id: str, notification_type: str) -> bool:
+    """Checks if a specific notification has been sent."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT 1 FROM sent_notifications
+                WHERE chat_id = ? AND player_id = ? AND game_id = ? AND notification_type = ?
+            ''', (chat_id, player_id, game_id, notification_type))
+            return cursor.fetchone() is not None
+    except sqlite3.Error as e:
+        logger.error(f"Error checking sent notification: {e}")
+        return False # Assume not sent on error to be safe? Or True? Needs thought.
+
+def mark_notification_sent(chat_id: int, player_id: int, game_id: str, notification_type: str):
+    """Marks a notification as sent."""
+    try:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR IGNORE INTO sent_notifications (chat_id, player_id, game_id, notification_type)
+                VALUES (?, ?, ?, ?)
+            ''', (chat_id, player_id, game_id, notification_type))
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error marking notification sent: {e}")
+
+async def check_upcoming_games(context: ContextTypes.DEFAULT_TYPE):
+    """Checks for games happening tomorrow and notifies followed players."""
+    logger.info("Running job: check_upcoming_games")
+    now_et = datetime.datetime.now(NBA_TZ)
+    tomorrow_et_start = (now_et + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    day_after_tomorrow_et_start = (now_et + datetime.timedelta(days=2)).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    logger.info(f"Checking for games between {tomorrow_et_start} and {day_after_tomorrow_et_start}")
+
+    # 1. Get all follows (player_id -> list[chat_id])
+    all_follows = get_all_follows()
+    if not all_follows:
+        logger.info("No players being followed. Skipping upcoming game check.")
+        return
+
+    # 2. Fetch relevant games (e.g., next few days)
+    # Note: LeagueGameFinder might not be the *most* efficient way, but it's available
+    # Filtering by date isn't directly supported in the params AFAIK, so we fetch recent/future
+    try:
+        finder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00') # '00' for NBA
+        all_games_df = finder.get_data_frames()[0]
+        if all_games_df.empty:
+            logger.warning("LeagueGameFinder returned no games.")
+            return
+
+        # Convert game dates to aware datetime objects in NBA timezone
+        # Handle potential variations in GAME_DATE format if necessary
+        try:
+            all_games_df['GAME_DATETIME'] = pd.to_datetime(all_games_df['GAME_DATE'], errors='coerce').dt.tz_localize(NBA_TZ) # Assume dates are ET
+        except Exception as date_err:
+            logger.error(f"Could not parse GAME_DATE with timezone: {date_err}")
+            # Try another format or skip
+            try:
+                # Example: If date is like 'APR 08, 2025'
+                all_games_df['GAME_DATETIME'] = pd.to_datetime(all_games_df['GAME_DATE'], format='%b %d, %Y', errors='coerce').dt.tz_localize(NBA_TZ)
+            except Exception as date_err_2:
+                logger.error(f"Could not parse GAME_DATE with alternate format: {date_err_2}")
+                return # Cannot proceed without dates
+
+        # Filter games happening "tomorrow" relative to NBA_TZ
+        upcoming_games_df = all_games_df[
+            (all_games_df['GAME_DATETIME'] >= tomorrow_et_start) &
+            (all_games_df['GAME_DATETIME'] < day_after_tomorrow_et_start)
+        ].copy() # Use .copy() to avoid SettingWithCopyWarning
+
+        logger.info(f"Found {len(upcoming_games_df)} games scheduled for tomorrow ({tomorrow_et_start.date()}).")
+
+    except Exception as e:
+        logger.error(f"Error fetching or processing game schedule: {e}")
+        return
+
+    # 3. Check each game against followed players
+    processed_players_for_job = set() # Optimization: Process each player once per job run
+
+    for index, game in upcoming_games_df.iterrows():
+        game_id = game['GAME_ID']
+        matchup = game['MATCHUP'] # e.g., 'LAL @ GSW' or 'LAL vs. GSW'
+        team_ids = [game['TEAM_ID']] # The primary team_id in the row
+        # TODO: Need a reliable way to get BOTH team IDs from the matchup string or game data.
+        # This is a limitation of LeagueGameFinder's structure per row.
+        # A potential workaround is to find the opponent ID from another row with the same game_id
+        opponent_row = all_games_df[(all_games_df['GAME_ID'] == game_id) & (all_games_df['TEAM_ID'] != game['TEAM_ID'])]
+        if not opponent_row.empty:
+            opponent_id = opponent_row.iloc[0]['TEAM_ID']
+            team_ids.append(opponent_id)
+            opponent_abbr = opponent_row.iloc[0]['TEAM_ABBREVIATION']
+            home_away_indicator = '@' if '@' in matchup else 'vs.'
+            if game['TEAM_ABBREVIATION'] in matchup.split(home_away_indicator)[0]: # This team is listed first
+                opponent_team_name = opponent_abbr # Simplified name
+            else:
+                opponent_team_name = matchup.split(home_away_indicator)[0].strip() # Try to get from matchup string
+
+            # A better approach might involve getting team name from opponent_id using teams.find_team_by_id
+            opponent_info = teams.find_team_by_id(opponent_id)
+            if opponent_info:
+                opponent_team_name = opponent_info['nickname'] # Or full_name
+
+        else:
+            opponent_team_name = "opponent" # Fallback
+
+        # Check players on BOTH teams involved in the game
+        # This requires mapping player_id to team_id, which we don't have directly stored.
+        # Option A: Call CommonTeamRoster for both teams (API intensive!)
+        # Option B: Assume player is on their 'current' team (needs lookup) - Less reliable due to trades/injuries near game time
+        # Option C: Iterate through all followed players and check if *their team* is playing (more efficient)
+
+        # Let's try Option C (Iterate through follows):
+        for player_id, chat_ids in all_follows.items():
+            if player_id in processed_players_for_job:
+                 continue # Already notified (or checked) this player for *some* game tomorrow
+
+            try:
+                # Find the player's current team - requires an API call per player!
+                # This is potentially slow and API-heavy. Consider caching.
+                player_info = commonplayerinfo.CommonPlayerInfo(player_id=player_id)
+                player_df = player_info.get_data_frames()[0]
+                if player_df.empty:
+                    logger.warning(f"Could not get info for player ID {player_id}")
+                    continue
+                current_team_id = player_df.iloc[0]['TEAM_ID']
+                player_full_name = player_df.iloc[0]['DISPLAY_FIRST_LAST'] # Get canonical name
+
+                # If this player's current team is in the game:
+                if current_team_id in team_ids:
+                    game_date_str = game['GAME_DATETIME'].strftime('%b %d, %Y')
+                     # Determine opponent for *this* player
+                    player_opponent_id = opponent_id if current_team_id == game['TEAM_ID'] else game['TEAM_ID']
+                    opponent_info = teams.find_team_by_id(player_opponent_id)
+                    opponent_name = opponent_info['nickname'] if opponent_info else 'opponent'
+                    matchup_desc = f"vs {opponent_name}" if home_away_indicator == 'vs.' else f"@ {opponent_name}"
+
+
+                    # Notify all users following this player
+                    for chat_id in chat_ids:
+                        if not has_notification_been_sent(chat_id, player_id, game_id, 'upcoming'):
+                            message = (f"🔔 Game Tomorrow ({game_date_str})!\n\n"
+                                        f"{player_full_name} has a game {matchup_desc}.")
+                            try:
+                                await context.bot.send_message(chat_id=chat_id, text=message)
+                                mark_notification_sent(chat_id, player_id, game_id, 'upcoming')
+                                logger.info(f"Sent upcoming game notification to {chat_id} for player {player_id}, game {game_id}")
+                            except (Forbidden, BadRequest) as send_err:
+                                logger.warning(f"Failed to send upcoming notification to {chat_id}: {send_err} - User might have blocked the bot.")
+                                # Optional: Remove follow if Forbidden? Or just log.
+                            except Exception as e:
+                                logger.error(f"Error sending upcoming notification to {chat_id}: {e}")
+                    processed_players_for_job.add(player_id) # Mark player processed for this job run
+
+            except Exception as player_err:
+                logger.error(f"Error processing player ID {player_id} for upcoming games: {player_err}")
+                # Avoid adding to processed_players_for_job if error occurs before check
+
+    logger.info("Finished job: check_upcoming_games")
+
+async def check_finished_games(context: ContextTypes.DEFAULT_TYPE):
+    """Checks for games finished yesterday and sends stats to followers."""
+    logger.info("Running job: check_finished_games")
+    now_et = datetime.datetime.now(NBA_TZ)
+    yesterday_et = (now_et - datetime.timedelta(days=1)).date()
+
+    logger.info(f"Checking for games finished on {yesterday_et}")
+
+    # 1. Get all follows (player_id -> list[chat_id])
+    all_follows = get_all_follows()
+    if not all_follows:
+        logger.info("No players being followed. Skipping finished game check.")
+        return
+
+    # 2. Fetch games from yesterday
+    # Using LeagueGameFinder again, filtering needed
+    try:
+        finder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00')
+        all_games_df = finder.get_data_frames()[0]
+        if all_games_df.empty:
+            logger.warning("LeagueGameFinder returned no games for finished check.")
+            return
+
+        # Convert game dates and filter for yesterday
+        try:
+            # Try multiple formats if needed
+            all_games_df['GAME_DATETIME'] = pd.to_datetime(all_games_df['GAME_DATE'], errors='coerce').dt.tz_localize(NBA_TZ)
+        except Exception:
+            try:
+                all_games_df['GAME_DATETIME'] = pd.to_datetime(all_games_df['GAME_DATE'], format='%b %d, %Y', errors='coerce').dt.tz_localize(NBA_TZ)
+            except Exception as date_err:
+                logger.error(f"Could not parse GAME_DATE for finished games: {date_err}")
+                return
+
+        # Keep only games played yesterday, ensure WL column exists (indicates completed)
+        finished_games_df = all_games_df[
+            (all_games_df['GAME_DATETIME'].dt.date == yesterday_et) &
+            (all_games_df['WL'].notna()) # Check if result is recorded
+        ].copy()
+
+        logger.info(f"Found {len(finished_games_df)} potential finished game records from {yesterday_et}.")
+        # Note: Each game appears twice (once per team)
+
+    except Exception as e:
+        logger.error(f"Error fetching or processing game schedule for finished check: {e}")
+        return
+
+    # 3. Check each finished game against followed players
+    processed_games_for_player = {} # player_id -> set(game_id) to avoid duplicate checks per player per game
+
+    for player_id, chat_ids in all_follows.items():
+        # Get player's game log for yesterday's date range
+        try:
+            # PlayerGameLog needs season, let's derive it (simple approach)
+            # TODO: This needs a more robust way to handle season transitions
+            season_year = yesterday_et.year if yesterday_et.month >= 10 else yesterday_et.year - 1
+            season_str = f"{season_year}-{str(season_year+1)[-2:]}"
+
+            gamelog = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=season_str,
+                date_from_nullable=yesterday_et.strftime('%m/%d/%Y'),
+                date_to_nullable=yesterday_et.strftime('%m/%d/%Y')
+            )
+            log_df = gamelog.get_data_frames()[0]
+
+            if log_df.empty:
+                #logger.info(f"Player {player_id} had no game log for {yesterday_et}")
+                continue # Player didn't play or log not updated yet
+
+            # Should only be one game if date range is one day
+            if len(log_df) > 1:
+                logger.warning(f"Player {player_id} had multiple game logs for {yesterday_et}. Using the first.")
+
+            last_game = log_df.iloc[0]
+            game_id = last_game['Game_ID'] # Use the Game_ID from the log
+            player_full_name = last_game['PLAYER_NAME'] # Get name from log
+
+            # Check if we've already processed this specific game for this player
+            if player_id in processed_games_for_player and game_id in processed_games_for_player[player_id]:
+                continue
+
+            # Format stats
+            game_date = last_game['GAME_DATE']
+            matchup = last_game['MATCHUP']
+            wl = last_game['WL']
+            pts = last_game['PTS']
+            reb = last_game['REB']
+            ast = last_game['AST']
+            # ... (include other relevant stats like in /lastgame)
+            fgm = last_game['FGM']
+            fga = last_game['FGA']
+            fg_pct = (fgm / fga * 100) if fga > 0 else 0
+            # ... etc ...
+
+            stats_message = (
+                    f"📊 **{player_full_name} - Game Stats ({game_date})**\n"
+                    f"Matchup: {matchup} ({wl})\n\n"
+                    f"PTS: {pts} | REB: {reb} | AST: {ast}\n"
+                    f"FG: {fgm}/{fga} ({fg_pct:.1f}%)\n"
+                    # ... add more stats ...
+                )
+            for chat_id in chat_ids:
+                if not has_notification_been_sent(chat_id, player_id, game_id, 'finished'):
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=stats_message, parse_mode='Markdown')
+                        mark_notification_sent(chat_id, player_id, game_id, 'finished')
+                        logger.info(f"Sent finished game stats to {chat_id} for player {player_id}, game {game_id}")
+                    except (Forbidden, BadRequest) as send_err:
+                        logger.warning(f"Failed to send finished stats to {chat_id}: {send_err}")
+                    except Exception as e:
+                        logger.error(f"Error sending finished stats to {chat_id}: {e}")
+
+            # Mark game as processed for this player
+            if player_id not in processed_games_for_player:
+                processed_games_for_player[player_id] = set()
+            processed_games_for_player[player_id].add(game_id)
+
+        except Exception as e:
+            logger.error(f"Error processing finished games/stats for player ID {player_id}: {e}")
+            import traceback
+            traceback.print_exc() # More detail for debugging
+
+    logger.info("Finished job: check_finished_games")
 
 # --- Helper Functions (NBA API - unchanged) ---
 
@@ -450,40 +800,108 @@ async def next_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     team_info = found_teams[0]
     team_id = team_info['id']
     team_full_name = team_info['full_name']
+    
+    logger.info(f"Looking for next game for team: {team_full_name} (ID: {team_id})")
 
     try:
-        finder = leaguegamefinder.LeagueGameFinder(team_id_nullable=team_id)
-        games_df = finder.get_data_frames()[0]
+        # Use the current season for more accurate results
+        current_season = get_season_string()
+        logger.info(f"Using season: {current_season}")
+        
+        # Try to get games for the current season
+        try:
+            finder = leaguegamefinder.LeagueGameFinder(
+                team_id_nullable=team_id,
+                season_nullable=current_season
+            )
+            games_df = finder.get_data_frames()[0]
+        except Exception as api_err:
+            logger.error(f"Error with primary API call: {api_err}")
+            # Fallback to a simpler query without season
+            logger.info("Trying fallback API call without season parameter")
+            finder = leaguegamefinder.LeagueGameFinder(team_id_nullable=team_id)
+            games_df = finder.get_data_frames()[0]
+        
+        logger.info(f"Found {len(games_df)} games for {team_full_name}")
 
         if games_df.empty:
             await update.message.reply_text(f"Could not find any game data for the {team_full_name}.")
             return
 
+        # Log the first few rows to understand the data structure
+        logger.info(f"Game data sample: {games_df.head(2).to_dict()}")
+        
+        # Check if GAME_DATE column exists
+        if 'GAME_DATE' not in games_df.columns:
+            logger.error(f"GAME_DATE column not found in game data. Columns: {games_df.columns.tolist()}")
+            await update.message.reply_text("Error: Game date information not available in the API response.")
+            return
+            
+        # Try to parse dates with more robust error handling
         try:
+            # First try standard format
             games_df['GAME_DATETIME'] = pd.to_datetime(games_df['GAME_DATE'], errors='coerce')
-        except ValueError:
-            try:
+            
+            # Check if we have any valid dates
+            if games_df['GAME_DATETIME'].isna().all():
+                logger.warning("All dates are NaN after first parsing attempt, trying alternative format")
+                # Try alternative format
                 games_df['GAME_DATETIME'] = pd.to_datetime(games_df['GAME_DATE'], format='%b %d, %Y', errors='coerce')
-            except Exception as date_err:
-                logger.error(f"Could not parse GAME_DATE format: {date_err}")
-                await update.message.reply_text("Error parsing game dates. Cannot determine next game.")
-                return
+                
+                # If still all NaN, try another format
+                if games_df['GAME_DATETIME'].isna().all():
+                    logger.warning("All dates are NaN after second parsing attempt, trying another format")
+                    games_df['GAME_DATETIME'] = pd.to_datetime(games_df['GAME_DATE'], format='%Y-%m-%d', errors='coerce')
+        except Exception as date_err:
+            logger.error(f"Error parsing game dates: {date_err}")
+            await update.message.reply_text("Error parsing game dates. Cannot determine next game.")
+            return
 
+        # Remove rows with NaN dates
         games_df = games_df.dropna(subset=['GAME_DATETIME'])
-        today = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        if games_df.empty:
+            logger.error("No valid dates found after parsing")
+            await update.message.reply_text("Error: No valid game dates found in the API response.")
+            return
+            
+        # Get current date in the NBA timezone
+        now = datetime.datetime.now(NBA_TZ)
+        today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        # Filter for future games and sort by date
         future_games = games_df[games_df['GAME_DATETIME'] >= today].sort_values(by='GAME_DATETIME')
+        
+        logger.info(f"Found {len(future_games)} future games for {team_full_name}")
 
         if future_games.empty:
             await update.message.reply_text(f"Couldn't find any upcoming games for the {team_full_name} in the available data. Schedule might be outdated.")
             return
 
         next_game = future_games.iloc[0]
-        game_date_str = next_game['GAME_DATETIME'].strftime('%a, %b %d, %Y')
-        matchup = next_game['MATCHUP']
+        game_date = next_game['GAME_DATETIME']
+        
+        # Format the date in a user-friendly way
+        game_date_str = game_date.strftime('%a, %b %d, %Y')
+        
+        # Get matchup information
+        matchup = next_game.get('MATCHUP', 'Unknown Opponent')
+        
+        # Try to get game time if available
+        game_time = ""
+        if 'GAME_TIME' in next_game and pd.notna(next_game['GAME_TIME']):
+            game_time = f"\n🕒 Time: {next_game['GAME_TIME']}"
+        
+        # Try to get location if available
+        location = ""
+        if 'HOME_TEAM_ID' in next_game and pd.notna(next_game['HOME_TEAM_ID']):
+            is_home = next_game['HOME_TEAM_ID'] == team_id
+            location = "Home" if is_home else "Away"
 
         message = (
             f"⏭️ **Next Game for {team_full_name}**\n\n"
-            f"📅 Date: {game_date_str}\n"
+            f"📅 Date: {game_date_str}{game_time}\n"
+            f"📍 Location: {location}\n"
             f"🆚 Matchup: {matchup}\n\n"
             f"_(Note: Schedule data might have delays. Game time isn't always available here.)_"
         )
@@ -491,6 +909,8 @@ async def next_game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error fetching next game for team ID {team_id} ({team_full_name}): {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         await update.message.reply_text(f"Sorry, an error occurred while fetching the next game for {team_full_name}.")
 
 
@@ -572,7 +992,6 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     player_name_query = " ".join(context.args)
 
-    # Validate player exists using NBA API
     found_players = await find_player(player_name_query)
     if not found_players:
         await update.message.reply_text(f"Hmm, I couldn't find an active player matching '{player_name_query}'. Please check the name.")
@@ -580,19 +999,27 @@ async def follow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(found_players) > 1:
         await update.message.reply_text(f"Found multiple players for '{player_name_query}'. Following the first match: {found_players[0]['full_name']}. Be more specific next time if this is wrong.")
 
-    # Use the canonical name from the search results
-    player_to_follow = found_players[0]['full_name']
+    # Get player info from the first match
+    player_info = found_players[0]
+    player_to_follow_id = player_info['id']
+    player_to_follow_name = player_info['full_name'] # Use the canonical name
 
-    # Add to database
-    was_added = add_follow(chat_id, player_to_follow)
+    # Add to database using the new function signature
+    was_added = add_follow(chat_id, player_to_follow_id, player_to_follow_name)
 
     if was_added:
-        logger.info(f"User {chat_id} started following {player_to_follow}")
-        await update.message.reply_text(f"✅ You are now following {player_to_follow}!")
+        logger.info(f"User {chat_id} started following {player_to_follow_name} (ID: {player_to_follow_id})")
+        await update.message.reply_text(f"✅ You are now following {player_to_follow_name}!")
     else:
         # Check if it failed because they already follow, or a DB error occurred
-        # (add_follow logs DB errors, so here we assume it means they already follow)
-        await update.message.reply_text(f"You are already following {player_to_follow}.")
+        # We query the DB to be sure why it failed (already exists is most likely)
+        current_follows = get_followed_players(chat_id)
+        already_following = any(p_id == player_to_follow_id for p_id, name in current_follows)
+        if already_following:
+            await update.message.reply_text(f"You are already following {player_to_follow_name}.")
+        else:
+            # If not already following, it must have been a DB error logged by add_follow
+            await update.message.reply_text(f"An error occurred while trying to follow {player_to_follow_name}. Please try again later.")
 
 
 async def unfollow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -602,40 +1029,48 @@ async def unfollow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please provide a player name to unfollow.\nUsage: `/unfollow [player_name]`")
         return
 
-    # Important: Use the exact player name format the user provides,
-    # as our DB query uses COLLATE NOCASE for matching.
     player_name_query = " ".join(context.args)
 
-    # Remove from database
+    # Use the modified remove_follow (still works by name)
     was_removed = remove_follow(chat_id, player_name_query)
 
     if was_removed:
         logger.info(f"User {chat_id} unfollowed {player_name_query}")
         await update.message.reply_text(f"❌ You are no longer following {player_name_query}.")
     else:
-        # remove_follow returns False if player wasn't found for that user or DB error
-        # Check if they follow anything at all first for a better message
         current_follows = get_followed_players(chat_id)
         if not current_follows:
             await update.message.reply_text("You weren't following any players.")
         else:
-            await update.message.reply_text(f"You weren't following anyone matching '{player_name_query}'.\n"
-                                            f"Use `/following` to see who you follow.")
+            # Check if the name actually exists in their follows for a better message
+            followed_names = [name for p_id, name in current_follows]
+            if player_name_query not in followed_names:
+                await update.message.reply_text(f"You weren't following anyone named '{player_name_query}'.\n"
+                                                f"Use `/following` to see exact names.")
+            else:
+                # If name was correct but remove failed, likely DB error
+                await update.message.reply_text(f"An error occurred trying to unfollow '{player_name_query}'.")
 
 
 async def following_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Lists the players the user is currently following from the database."""
     chat_id = update.effective_chat.id
 
-    # Get list from database
-    followed_list = get_followed_players(chat_id)
+    # Get list from database (returns tuples of id, name)
+    followed_list_tuples = get_followed_players(chat_id)
 
-    if not followed_list:
+    if not followed_list_tuples:
         await update.message.reply_text("You aren't following any players yet. Use `/follow [player_name]` to start!")
         return
 
+    # Extract just the names for display
+    followed_names = [name for p_id, name in followed_list_tuples]
+
+    message = "⭐ **You are following:**\n\n" + "\n".join(f"- {name}" for name in followed_names)
+    await update.message.reply_text(message, parse_mode='Markdown')
+
     # List is already sorted by the DB query
-    message = "⭐ **You are following:**\n\n" + "\n".join(f"- {name}" for name in followed_list)
+    message = "⭐ **You are following:**\n\n" + "\n".join(f"- {name}" for name in followed_names)
     await update.message.reply_text(message, parse_mode='Markdown')
 
 
@@ -665,13 +1100,12 @@ if __name__ == "__main__":
         logger.error("FATAL: TELEGRAM_BOT_TOKEN environment variable not set.")
         exit(1)
 
-    # --- Initialize Database ---
+        # --- Initialize Database ---
     try:
-        init_db()
+        init_db() # This will now create/update both tables
     except sqlite3.Error:
         logger.error("FATAL: Could not initialize the database. Exiting.")
         exit(1)
-    # -------------------------
 
     logger.info("Starting bot...")
 
@@ -679,7 +1113,25 @@ if __name__ == "__main__":
     builder.post_init(post_init)
     application = builder.build()
 
-    # Register command handlers
+    # --- Job Queue Setup ---
+    job_queue = application.job_queue
+
+    # Check if job queue is available
+    if job_queue is not None:
+        job_upcoming = job_queue.run_daily(
+            check_upcoming_games,
+            time=datetime.time(hour=12, minute=0, second=0),
+            name="check_upcoming_games_daily"
+        )
+        job_finished = job_queue.run_daily(
+            check_finished_games,
+            time=datetime.time(hour=16, minute=0, second=0),
+            name="check_finished_games_daily"
+        )
+        logger.info("Scheduled daily jobs: Upcoming check at 12:00, Finished check at 16:00 (server time/UTC)")
+    else:
+        logger.warning("Job queue is not available. Scheduled jobs will not run. Install python-telegram-bot[job-queue] to enable this feature.")
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("playerstats", player_stats_command))
@@ -691,6 +1143,7 @@ if __name__ == "__main__":
     application.add_handler(CommandHandler("follow", follow_command))
     application.add_handler(CommandHandler("unfollow", unfollow_command))
     application.add_handler(CommandHandler("following", following_command))
+
 
     logger.info("Running application.run_polling()...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
